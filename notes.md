@@ -15,7 +15,8 @@ Study notes for this repo. They explain the ideas the project uses, tie each one
 7. [Known pitfalls in this repo](#7-known-pitfalls-in-this-repo)
 8. [Ideas to take it further](#8-ideas-to-take-it-further)
 9. [Glossary](#9-glossary)
-10. [Self-check questions](#10-self-check-questions)
+10. [The LLM-as-a-judge in this project](#10-the-llm-as-a-judge-in-this-project)
+11. [Self-check questions](#11-self-check-questions)
 
 ---
 
@@ -186,6 +187,8 @@ Scoring with another LLM instead of string matching.
 - **Mitigations:** use a *different* model as judge than as generator (here Qwen generates and gpt-oss judges), keep `temperature=0`, write narrow criteria, and spot-check the judge's `reason` text.
 - **Custom judge wrapper:** DeepEval defaults to an OpenAI judge. [`groq_judge.py`](groq_judge.py) subclasses `DeepEvalBaseLLM` and implements `load_model`, `generate`, `a_generate` and `get_model_name`. DeepEval passes a Pydantic `schema` and expects an instance back, so the wrapper uses `with_structured_output(schema, method="json_schema")`. The `a_generate` method is the async version, so DeepEval can score many cases concurrently.
 
+For how this project's judge is set up, how it behaves on the saved runs and how to improve it, see [section 10](#10-the-llm-as-a-judge-in-this-project).
+
 ### 4.6 Thresholds and pass rates
 
 - A **threshold** turns a continuous score into pass/fail (`metric.is_successful()`).
@@ -337,7 +340,135 @@ Found while reading the code. These are lessons, not blame. Each one is a realis
 
 ---
 
-## 10. Self-check questions
+## 10. The LLM-as-a-judge in this project
+
+[Section 4.5](#45-llm-as-a-judge) explains the idea in general. This section is about *this repo's* judge: how it is set up, what the saved scores suggest about its quality, and how to improve it.
+
+> The numbers below come from the three saved runs (`versions/vN/evaluated_results*.jsonl`: 20 cases each, 60 scored rows in all). Those runs predate the context fix ([pitfall 1](#7-known-pitfalls-in-this-repo)), so treat the faithfulness and context-relevancy rows as provisional until the pipeline is re-run. "Pass" means a score of at least 0.7, and "perfect" means exactly 1.0.
+
+### 10.1 What the current judge is
+
+| Aspect | Current setup |
+|---|---|
+| Judge model | `openai/gpt-oss-120b`, served by Groq. It is an open-weight model published by OpenAI and is called with `GROQ_API_KEY`, not through the OpenAI API. The answer-relevancy demo in [`single_tests/`](single_tests/) uses the smaller `20b` version. |
+| Wrapper | `GroqJudge` in [`groq_judge.py`](groq_judge.py), a `DeepEvalBaseLLM` subclass: `temperature=0`, sync and async calls, structured output through `with_structured_output(schema, method="json_schema")`. |
+| Relation to the generator | A different model (the generator is a Groq-hosted Qwen model), so the system does not grade its own output. |
+| What it judges | Three built-in metrics (answer relevancy, faithfulness, contextual relevancy) and one custom G-Eval metric, "Correctness". |
+| Correctness criterion | One sentence: "Determine whether the actual output is factually correct based on the expected output". The judge sees only the actual and expected answers, **not the question**. |
+| Threshold | `0.7` for every metric. |
+| What is saved | Scores only. The judge's `reason` for each score is dropped. |
+| Validation | None yet. It has never been compared with human labels. |
+| Configuration | The model name is hard-coded in each scorer script, and a new `GroqJudge` is created per metric. |
+
+**Strengths:** a separate judge model, `temperature=0`, no OpenAI key needed, and the answers are stored separately from the scores (so scoring can be redone).
+**Limits:** a single judge, no calibration against humans, no saved reasons, one flat threshold, and (see below) two metrics that cannot discriminate.
+
+### 10.2 What the saved scores say about it
+
+| Metric | Run | Pass | Perfect (1.0) | Lowest score |
+|---|---|---:|---:|---:|
+| Answer relevancy | v1 / v2 / v3 | 20 / 20 / 20 | 18 / 20 / 20 | 0.88 |
+| Faithfulness | v1 / v2 / v3 | 20 / 20 / 20 | 20 / 20 / 20 | 1.00 |
+| Context relevancy | v1 / v2 / v3 | 10 / 12 / 12 | 10 / 11 / 12 | 0.14 |
+| Correctness | v1 / v2 / v3 | 19 / 19 / 19 | 8 / 7 / 7 | 0.23 |
+
+(Each cell is "out of 20" cases per run.)
+
+What this shows:
+
+1. **Two metrics are saturated.** Faithfulness is perfect in 60 of 60 rows and answer relevancy in 58 of 60. A metric that is always 1.0 cannot tell a good run from a bad one. Faithfulness is also affected by the model-written-context problem, so part of this is a measurement issue and not a judge issue.
+2. **Context relevancy is the only metric with real spread, and it is split in two.** Only 10 to 12 of 20 cases pass per run. The 0.73 to 0.79 averages hide a mix of perfect scores and failures, so always look at pass counts, not only averages.
+3. **Correctness has at least one likely false negative.** In v1 this answer scored **0.32** (and 0.36 in v3, where it carries one extra sentence):
+   - Expected: "Emperor penguins balance a single egg on their feet beneath a warm fold of skin."
+   - Actual: "Emperor penguins incubate their eggs by balancing a single egg on their feet beneath a warm fold of skin."
+
+   The v2 run's lowest score (0.23, for "How do penguins stay warm in cold water?") also deserves a look, because its answer starts by listing the same fat-and-feathers adaptations as the reference.
+4. **A tempting explanation does not hold.** Your answers are about 3 times as long as the references (mean 3.0x, range 0.9x to 6.4x), so verbosity bias looked plausible. It is not supported: the correlation between length ratio and correctness is +0.20 (longer answers scored slightly *higher*), and mean correctness is 0.88 for answers under 2.5x the reference length versus 0.91 for longer ones. So the cause of the low scores is **unknown**, and the judge's saved reasons are the way to find out. That is why they should be stored.
+
+### 10.3 How to improve it
+
+Ordered by value.
+
+1. **Save the judge's reasons.** Each `metric` in `test_result.metrics_data` has a `.reason`. Add it to the row written by the `*_fast.py` scripts:
+
+   ```python
+   evaluated_result = {
+       **original_result,
+       "answer_relevancy": answer_relevancy_score,
+       "faithfulness": faithfulness_score,
+       "context_relevancy": context_relevancy_score,
+       "correctness": correctness_score,
+       "reasons": {metric.name: metric.reason for metric in test_result.metrics_data or []},
+   }
+   ```
+
+   Then read the reasons for the lowest-scoring rows. This is the fastest way to find judge mistakes.
+
+2. **Check the judge against humans.** Hand-label 30 to 50 question/answer pairs as correct or incorrect (include both good answers and deliberately wrong ones), run the judge on them and measure agreement:
+
+   ```python
+   # judge_labels.jsonl: {"question", "expected_answer", "actual_answer", "human_label": "correct" | "incorrect"}
+   agreement = mean((judge_score >= 0.7) == (label == "correct") for judge_score, label in pairs)
+   ```
+
+   Report plain agreement and Cohen's kappa (agreement beyond chance). As a rough guide, a kappa above about 0.6 counts as substantial agreement. Without this step you cannot say how far to trust any score.
+
+3. **Rewrite the correctness metric.** Give the judge the question and explicit steps, including an instruction not to penalise extra correct detail (your answers are much longer than the references). In DeepEval, `evaluation_steps` replaces `criteria`; you provide one or the other:
+
+   ```python
+   correctness = GEval(
+       name="Correctness",
+       evaluation_params=[SingleTurnParams.INPUT, SingleTurnParams.ACTUAL_OUTPUT, SingleTurnParams.EXPECTED_OUTPUT],
+       evaluation_steps=[
+           "Identify the key facts in the expected output.",
+           "Lower the score if a key fact is missing from the actual output or contradicted by it.",
+           "Do not penalize extra detail or different wording that does not contradict the expected output.",
+       ],
+       model=GroqJudge("openai/gpt-oss-120b"),
+       threshold=0.7,
+   )
+   ```
+
+   G-Eval also accepts a `rubric` (score bands with descriptions) if you want tighter control.
+
+4. **Turn the single tests into a judge test suite.** The bad examples in [`single_tests/`](single_tests/) ("feed on cars", "live in Maharashtra", "Penguins are stupid.") are the right idea. Keep about 20 known-good and known-bad cases with the expected outcome, and rerun them whenever you change the judge model, the criterion or the DeepEval version.
+
+5. **Reduce noise.**
+   - Score each case 2 to 3 times and average, and flag cases where the scores differ by more than about 0.2.
+   - Or use two different judge models and average them (a small "panel"), flagging disagreements for a manual look.
+   - Use the labelled set from step 2 to compare `gpt-oss-120b`, `gpt-oss-20b` and one stronger model, and pick the cheapest one that agrees well with you.
+
+6. **Fix saturation with harder tests.** Add questions that need two chunks, questions whose answer is *not* in the PDF, and trick questions. Pass rates near 100% mean the test is too easy, not that the system is perfect.
+
+7. **Make judge changes safe and visible.**
+   - Move the judge model name into one constant or an environment variable instead of five scripts, and record it (`judge_model`) in each `experiment_vN.jsonl`.
+   - **Never compare scores from different judges**: changing the judge changes the scale. Because `results*.jsonl` keep the generated answers and contexts, you can re-score old runs with the new judge without regenerating answers. Only the scoring step needs to be re-run.
+   - Add retry with backoff inside `GroqJudge`, and set `AsyncConfig(max_concurrent=...)` on `evaluate()` so Groq rate limits do not break a run.
+
+### 10.4 Judge biases to watch for
+
+| Bias | What it means | What to do here |
+|---|---|---|
+| Verbosity bias | Judges tend to favour longer, more detailed answers (or sometimes punish extra detail) | Ask the generator for concise answers, and state in the criterion how extra detail is treated. Check length against score as in 10.2. |
+| Self-preference | A judge favours text written by its own model family | Keep the judge different from the generator (already true here) |
+| Leniency and saturation | Judges give high scores too easily, so many metrics sit at 1.0 | Harder test cases, and calibration against human labels |
+| Criterion ambiguity | A vague criterion ("factually correct") is read differently from run to run | Explicit evaluation steps or a rubric |
+| Position bias | In pairwise comparison, the first or second answer is favoured | Not an issue here (each answer is scored alone), but relevant if you compare two answers side by side |
+
+### 10.5 Judge checklist
+
+- [ ] Reasons saved next to every score
+- [ ] 30 to 50 human-labelled pairs, with agreement and kappa measured
+- [ ] Correctness metric sees the question and uses explicit steps or a rubric
+- [ ] Judge test suite of known-good and known-bad cases
+- [ ] Repeat scoring or a second judge to estimate noise
+- [ ] Harder questions added so no metric sits at 1.0
+- [ ] Judge model in one place and recorded in every experiment file
+- [ ] Old runs re-scored with any new judge before comparing them
+
+---
+
+## 11. Self-check questions
 
 1. Why must the query be embedded with the *same* model as the chunks?
 2. What changes in the trade-off when `k` goes from 1 to 3? Which metric should move first, and in which direction?
@@ -349,3 +480,7 @@ Found while reading the code. These are lessons, not blame. Each one is a realis
 8. With 20 cases and a noisy judge, how would you decide whether a 0.03 difference between two runs is real?
 9. Why does `python versions/v3/script.py` fail to import `RAG1` while `python -m versions.v3.script` works?
 10. Give one question you would add to the dataset to test the "I don't know" behaviour.
+11. Faithfulness is perfect in all 60 scored rows. Give two different reasons why that number might not mean the system is good.
+12. The correctness judge gave 0.32 to an answer that is almost word for word the reference. What would you look at first, and which hypothesis (verbosity) did the data reject?
+13. Why must scores from two different judge models not be compared directly, and how can you re-score old runs cheaply?
+14. How would you measure whether the judge agrees with a human, and what does Cohen's kappa add over plain agreement?
