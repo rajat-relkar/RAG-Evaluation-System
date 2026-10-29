@@ -1,6 +1,6 @@
 # RAG Evaluation System
 
-> A compact evaluation lab for one RAG pipeline: ask questions about a penguin PDF, score the answers with DeepEval, and compare saved evaluation runs.
+> A compact evaluation lab for RAG pipeline: ask questions about PDFs, score the answers with DeepEval, and compare saved evaluation runs.
 
 ![Python 3.14+](https://img.shields.io/badge/Python-3.14%2B-3776AB?logo=python&logoColor=white)
 ![DeepEval](https://img.shields.io/badge/Evaluation-DeepEval-147D64)
